@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dl24p"
+version = "0.1.0"
+description = "Control an ATORCH DL24 / DL24P electronic load over USB-HID"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = ["hidapi"]
+keywords = ["atorch", "dl24", "dl24p", "electronic load", "hid", "usb"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.setuptools]
+packages = ["dl24p"]
