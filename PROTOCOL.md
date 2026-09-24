@@ -12,6 +12,11 @@ command below was matched to exactly one action. Nothing here is guessed unless 
 - There is no serial/COM port. The load only sends data in reply to a request.
 - With hidapi, write `00` followed by the 64 bytes (report ID 0 first). Reads return the 64 bytes
   without a report ID.
+- Commands must go out as interrupt OUT on EP `0x01`. A `SET_REPORT(Output)` on EP0 is stalled.
+- After power-up the load only replies once it has received the HID class request
+  `SET_IDLE(0)` (`21 0a 00 00 00 00 00 00`). Before that it still executes commands, but it sends
+  nothing back. Windows sends `SET_IDLE(0)` right after enumeration. macOS does not, so the
+  library sends it itself (see `dl24p/macfix.py`). The load remembers it until it loses power.
 
 ## Frame format
 

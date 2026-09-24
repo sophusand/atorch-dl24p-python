@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dl24p"
-version = "0.1.0"
+version = "0.2.0"
 description = "Control an ATORCH DL24 / DL24P electronic load over USB-HID"
 readme = "README.md"
 license = {text = "MIT"}

@@ -79,7 +79,7 @@ python examples/battery_discharge.py --current 1.0 --cutoff 3.0 --out discharge.
 | Method | Description |
 |---|---|
 | `dl24p.find()` | List connected loads (hidapi info dicts) |
-| `DL24P(path=None)` | Open the first load, or a specific one via `path` from `find()` |
+| `DL24P(path=None, mac_fix=True)` | Open the first load, or a specific one via `path` from `find()`. On macOS it fixes a load that does not reply (see [Platform notes](#platform-notes)) |
 | `read()` | Live values → `Measurement`: `voltage`, `current`, `power`, `resistance`, `energy_wh`, `capacity_mah`, `temp_cpu`, `temp_mos`, `fan_rpm`, `output_on`, `raw` |
 | `settings()` | All settings → `Settings` (mode, set point, protections, display, calibration factors) |
 | `stream(interval)` | Endless generator of measurements |
@@ -89,14 +89,15 @@ python examples/battery_discharge.py --current 1.0 --cutoff 3.0 --out discharge.
 | `set_current(A)`, `set_voltage(V)`, `set_resistance(Ω)`, `set_power(W)` | Change mode and set the value in one call |
 | `set_time_limit(h, m)` | Maximum run time, enforced by the load (0, 0 = off) |
 | `set_cutoff_voltage(V)` | Stored and displayed, but **not enforced** by the load (see below) |
-| `set_over_current(A)`, `set_over_power(W)` | Protections |
+| `set_over_current(A)`, `set_over_power(W)` | Protections, enforced by the load (at most 20 A and the power limit at the present voltage) |
 | `set_over_temp_ext(°C)`, `set_over_temp_mos(°C)` | Temperature protections |
 | `set_brightness(1-9)`, `set_standby_brightness(1-9)`, `set_standby_time(1-60)` | Display |
 | `set_language("CN-A" \| "CN-B" \| "EN-A")` | Display language |
-| `send(cmd, data)` / `query(cmd)` | Raw protocol access |
+| `send(cmd, data)` / `query(cmd)` | Raw protocol access (set points and "on" are still checked against the limits) |
+| `dl24p.max_power(V)`, `dl24p.MAX_CURRENT`, `dl24p.MIN_VOLTAGE`, `dl24p.MAX_VOLTAGE` | The load's ratings from the user manual (see [Safety](#safety)) |
 
 Every `set_*` method reads the settings back and raises `dl24p.DL24PError` if the load did not
-accept the value.
+accept the value. Values outside the load's ratings are refused before anything is sent.
 
 ## Good to know
 
@@ -159,12 +160,14 @@ accept the value.
 - **macOS:** tested on an M2 MacBook with macOS 26. Two things to know:
   - The load's USB-C port does not work with a USB-C to USB-C cable (the Mac does not detect it).
     Use a USB-A cable with a USB-C to USB-A adapter or hub.
-  - After it is plugged in, the load often receives commands but does not reply, because macOS
-    does not send the HID `SET_IDLE` request that Windows sends. `DL24P()` detects this and
-    fixes it automatically: the library sends the request through libusb and connects again.
-    It first tries without a password; only if that is not enough, macOS asks for your password.
-    It needs `pyusb` (installed automatically on macOS) and libusb (`brew install libusb`). You can also run the fix by hand with
-    `sudo python -m dl24p.macfix`, or turn it off with `DL24P(mac_fix=False)`.
+  - After the load has been powered up, it often receives commands but does not reply, because
+    macOS does not send the HID `SET_IDLE` request that Windows sends. The load remembers the
+    request while it has power, so this comes back after a power cycle, not after a USB replug.
+    `DL24P()` detects it and fixes it automatically: it sends the request through libusb and
+    connects again. It first tries without a password, and only asks for it with the macOS
+    dialog if that is not enough. It needs libusb (`brew install libusb`). You can also run
+    the fix by hand with `python -m dl24p.macfix --no-root` or `sudo python -m dl24p.macfix`,
+    or turn it off with `DL24P(mac_fix=False)`.
 - **Linux:** needs permission to access the device (not tested). A udev rule such as
   `/etc/udev/rules.d/99-atorch-dl24.rules`:
 

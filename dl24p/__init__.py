@@ -21,7 +21,7 @@ from typing import Iterator
 
 import hid
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["DL24P", "Measurement", "Settings", "DL24PError", "MODES", "MODE_UNITS", "LANGUAGES", "find",
            "MAX_CURRENT", "MIN_VOLTAGE", "MAX_VOLTAGE", "max_power"]
 
@@ -159,6 +159,7 @@ class DL24P:
     Close the ATORCH PC app first, otherwise its polling mixes with yours.
     """
 
+    # ---------- connection ----------
     def __init__(self, path: bytes | None = None, address: int = 1, timeout: float = 1.0,
                  mac_fix: bool = True):
         """Open the load.
@@ -213,7 +214,6 @@ class DL24P:
         except DL24PError:
             return False
 
-    # ---------- connection ----------
     def close(self) -> None:
         self._dev.close()
 
@@ -253,6 +253,34 @@ class DL24P:
         self._guard(cmd, data)
         self._dev.write(self._frame(cmd, data))
 
+    def query(self, cmd: int) -> bytes:
+        """Send a read command and return the matching 64-byte reply."""
+        self._flush()
+        self.send(cmd)
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            r = self._dev.read(REPORT_LEN, 100)
+            if r and r[0] == 0xAA and r[2] == self.address and r[3] == cmd:
+                return bytes(r)
+        raise DL24PError(f"No reply to command 0x{cmd:02x}")
+
+    def _set_float(self, cmd: int, value: float) -> None:
+        self.send(cmd, struct.pack(">f", float(value)))
+
+    def _set_byte_last(self, cmd: int, value: int) -> None:
+        self.send(cmd, bytes([0, 0, 0, int(value) & 0xFF]))
+
+    def _verify(self, getter, expected, what: str, tol: float = 1e-3) -> None:
+        deadline = time.monotonic() + 2.0
+        got = None
+        while time.monotonic() < deadline:
+            got = getter(self.settings())
+            if (abs(got - expected) <= tol) if isinstance(expected, float) else got == expected:
+                return
+            time.sleep(0.1)
+        raise DL24PError(f"The device did not accept {what}={expected!r} (still {got!r})")
+
+    # ---------- safety limits ----------
     def _guard(self, cmd: int, data: bytes) -> None:
         """Check the load's whole state as it will be after this command.
 
@@ -292,32 +320,45 @@ class DL24P:
         self._dev.write(self._frame(cmd, struct.pack(">f", value)))
         self._verify(lambda s: getattr(s, field), round(float(value), 4), field)
 
-    def query(self, cmd: int) -> bytes:
-        """Send a read command and return the matching 64-byte reply."""
-        self._flush()
-        self.send(cmd)
-        deadline = time.monotonic() + self.timeout
-        while time.monotonic() < deadline:
-            r = self._dev.read(REPORT_LEN, 100)
-            if r and r[0] == 0xAA and r[2] == self.address and r[3] == cmd:
-                return bytes(r)
-        raise DL24PError(f"No reply to command 0x{cmd:02x}")
+    @staticmethod
+    def _check_limits(mode: str, value: float, voltage: float) -> None:
+        """Refuse set points outside the manual's ratings, given the voltage measured now.
 
-    def _set_float(self, cmd: int, value: float) -> None:
-        self.send(cmd, struct.pack(">f", float(value)))
-
-    def _set_byte_last(self, cmd: int, value: int) -> None:
-        self.send(cmd, bytes([0, 0, 0, int(value) & 0xFF]))
-
-    def _verify(self, getter, expected, what: str, tol: float = 1e-3) -> None:
-        deadline = time.monotonic() + 2.0
-        got = None
-        while time.monotonic() < deadline:
-            got = getter(self.settings())
-            if (abs(got - expected) <= tol) if isinstance(expected, float) else got == expected:
-                return
-            time.sleep(0.1)
-        raise DL24PError(f"The device did not accept {what}={expected!r} (still {got!r})")
+        The power checks use the present input voltage. If the source voltage rises later,
+        the power can still exceed the limit, so also set set_over_power() as a safety net.
+        """
+        if voltage > MAX_VOLTAGE:
+            raise DL24PError(f"Input voltage {voltage:.1f} V is above the load's {MAX_VOLTAGE:.0f} V limit")
+        p_max = max_power(voltage)
+        if mode == "CC":
+            current = value
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{current} A is above the load's {MAX_CURRENT:.0f} A limit")
+        elif mode == "CV":
+            if not MIN_VOLTAGE <= value <= MAX_VOLTAGE:
+                raise DL24PError(f"CV set point must be {MIN_VOLTAGE:.0f}-{MAX_VOLTAGE:.0f} V, got {value} V")
+            return  # the current is set by the source, so it cannot be checked here
+        elif mode == "CR":
+            if value <= 0:
+                raise DL24PError("CR set point must be above 0 ohm (0 ohm is a short circuit)")
+            current = voltage / value
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{value} ohm at {voltage:.2f} V draws {current:.1f} A, "
+                                 f"above the {MAX_CURRENT:.0f} A limit")
+        elif mode == "CP":
+            current = value / voltage if voltage > 0 else 0.0
+            if value > p_max:
+                raise DL24PError(f"{value} W is above the {p_max:.0f} W limit at {voltage:.1f} V")
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{value} W at {voltage:.2f} V draws {current:.1f} A, "
+                                 f"above the {MAX_CURRENT:.0f} A limit")
+            return
+        else:
+            return
+        power = voltage * current
+        if power > p_max:
+            raise DL24PError(f"{power:.1f} W ({voltage:.2f} V x {current:.2f} A) is above "
+                             f"the {p_max:.0f} W limit at this voltage")
 
     # ---------- reading ----------
     def read(self) -> Measurement:
@@ -429,46 +470,6 @@ class DL24P:
             raise ValueError("value must be >= 0")
         self._set_float(CMD_SET_VALUE, value)  # send() checks the limits
         self._verify(lambda s: s.value, round(float(value), 4), "set point")
-
-    @staticmethod
-    def _check_limits(mode: str, value: float, voltage: float) -> None:
-        """Refuse set points outside the manual's ratings, given the voltage measured now.
-
-        The power checks use the present input voltage. If the source voltage rises later,
-        the power can still exceed the limit, so also set set_over_power() as a safety net.
-        """
-        if voltage > MAX_VOLTAGE:
-            raise DL24PError(f"Input voltage {voltage:.1f} V is above the load's {MAX_VOLTAGE:.0f} V limit")
-        p_max = max_power(voltage)
-        if mode == "CC":
-            current = value
-            if current > MAX_CURRENT:
-                raise DL24PError(f"{current} A is above the load's {MAX_CURRENT:.0f} A limit")
-        elif mode == "CV":
-            if not MIN_VOLTAGE <= value <= MAX_VOLTAGE:
-                raise DL24PError(f"CV set point must be {MIN_VOLTAGE:.0f}-{MAX_VOLTAGE:.0f} V, got {value} V")
-            return  # the current is set by the source, so it cannot be checked here
-        elif mode == "CR":
-            if value <= 0:
-                raise DL24PError("CR set point must be above 0 ohm (0 ohm is a short circuit)")
-            current = voltage / value
-            if current > MAX_CURRENT:
-                raise DL24PError(f"{value} ohm at {voltage:.2f} V draws {current:.1f} A, "
-                                 f"above the {MAX_CURRENT:.0f} A limit")
-        elif mode == "CP":
-            current = value / voltage if voltage > 0 else 0.0
-            if value > p_max:
-                raise DL24PError(f"{value} W is above the {p_max:.0f} W limit at {voltage:.1f} V")
-            if current > MAX_CURRENT:
-                raise DL24PError(f"{value} W at {voltage:.2f} V draws {current:.1f} A, "
-                                 f"above the {MAX_CURRENT:.0f} A limit")
-            return
-        else:
-            return
-        power = voltage * current
-        if power > p_max:
-            raise DL24PError(f"{power:.1f} W ({voltage:.2f} V x {current:.2f} A) is above "
-                             f"the {p_max:.0f} W limit at this voltage")
 
     def _set_mode_value(self, mode: str, value: float) -> None:
         # Check the limits first, so a rejected value does not change the mode
