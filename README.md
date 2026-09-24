@@ -117,8 +117,38 @@ accept the value.
 
 ## Safety
 
-- Stay within the load's ratings and the source's limits. `set_over_current()` and
-  `set_over_power()` make a useful safety net while you experiment.
+- **Built-in limits from the user manual.** `set_current()`, `set_voltage()`, `set_resistance()`,
+  `set_power()` and `set_value()` raise `DL24PError` before sending anything if the set point is
+  outside the load's ratings, given the input voltage measured at that moment:
+
+  | Limit | Value |
+  |---|---|
+  | Current | 0–20 A (`dl24p.MAX_CURRENT`) |
+  | Voltage | 2–200 V (`dl24p.MIN_VOLTAGE`, `dl24p.MAX_VOLTAGE`) |
+  | Power below 36 V | 150 W |
+  | Power 36–80 V | 60 W |
+  | Power 80–200 V | 45 W (`dl24p.max_power(voltage)`) |
+
+  These limits apply to both the DL24 and the DL24P. The DL24P's 180 W is only its absolute
+  maximum. The library enforces them like this:
+  1. **Whole-state check before every change.** Before `send()` sends a set point, a protection
+     or "load on", it reads all settings and the present voltage, applies the command to them,
+     and checks the resulting state as a whole: set point, the current and power it gives,
+     and the load's own over-current/over-power protections. If anything is outside the limits,
+     nothing is sent and `DL24PError` is raised. Raw `send()` calls are checked the same way.
+  2. **Protections within the limits.** `set_over_current()` accepts at most 20 A and
+     `set_over_power()` at most the power limit at the present voltage. If the load's
+     protections are still above the limits (the factory setting is 25 A), they are lowered to
+     the limit at the next change. The load then enforces them itself while it runs.
+  3. **Switching on** runs the same check at the present voltage, because the set point may
+     have been set before the source was connected.
+  4. **Watchdog:** every `read()` (and so `stream()`) switches the load off and raises
+     `DL24PError` if the load is on and exceeds the limits, with a 2 % margin for noise.
+
+  The watchdog only works while your script calls `read()`. Between readings, only the load's own
+  protections (point 3) are active.
+- Stay within the source's limits as well, and set `set_over_current()` / `set_over_power()`
+  lower than the load's limits if the source needs it.
 - **Be careful with CV mode on stiff sources** (power supplies, batteries). If you set a voltage
   below the source voltage, the load pulls as much current as it can to reach it, limited only by
   the over-current protection.

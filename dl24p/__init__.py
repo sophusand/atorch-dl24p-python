@@ -21,7 +21,8 @@ from typing import Iterator
 import hid
 
 __version__ = "0.1.0"
-__all__ = ["DL24P", "Measurement", "Settings", "DL24PError", "MODES", "MODE_UNITS", "LANGUAGES", "find"]
+__all__ = ["DL24P", "Measurement", "Settings", "DL24PError", "MODES", "MODE_UNITS", "LANGUAGES", "find",
+           "MAX_CURRENT", "MIN_VOLTAGE", "MAX_VOLTAGE", "max_power"]
 
 VID = 0x0483
 PID = 0x5750
@@ -64,6 +65,24 @@ MODES = {
 }
 _MODE_BY_INDEX = {idx: name for name, (_, idx) in MODES.items() if idx is not None}
 MODE_UNITS = {"CC": "A", "CV": "V", "CR": "ohm", "CP": "W"}
+
+# Ratings from the ATORCH DL24/DL24P user manual (same for both models)
+MAX_CURRENT = 20.0    # A
+MIN_VOLTAGE = 2.0     # V, lowest voltage the load works at
+MAX_VOLTAGE = 200.0   # V
+LIMIT_MARGIN = 1.02   # the watchdog in read() allows 2 % measurement noise above the limits
+
+
+def max_power(voltage: float) -> float:
+    """Highest allowed power (W) at this input voltage, from the manual's derating table."""
+    if voltage < 36:
+        return 150.0
+    if voltage < 80:
+        return 60.0
+    if voltage <= MAX_VOLTAGE:
+        return 45.0
+    return 0.0
+
 
 # Language index as reported in the settings (EN-A = 3 is observed; the others are inferred)
 LANGUAGES = {"CN-A": 1, "CN-B": 2, "EN-A": 3, "EN-B": 4}
@@ -183,10 +202,54 @@ class DL24P:
             self._dev.set_nonblocking(False)
 
     def send(self, cmd: int, data: bytes = b"\0\0\0\0") -> None:
-        """Send a raw command with 4 data bytes."""
+        """Send a raw command with 4 data bytes.
+
+        Set points, protections and "load on" are checked against the load's ratings first,
+        so raw commands cannot bypass the limits either.
+        """
         if len(data) != 4:
             raise ValueError("data must be exactly 4 bytes")
+        self._guard(cmd, data)
         self._dev.write(self._frame(cmd, data))
+
+    def _guard(self, cmd: int, data: bytes) -> None:
+        """Check the load's whole state as it will be after this command.
+
+        Reads all settings and the present voltage, applies the command to them, and only
+        lets the command through if the resulting set point, current, power and the load's
+        own protections all stay within the ratings.
+        """
+        switching_on = cmd == CMD_OUTPUT and data[0]
+        if cmd not in (CMD_SET_VALUE, CMD_OVER_CURRENT, CMD_OVER_POWER) and not switching_on:
+            return  # reads, mode changes (they switch the load off), "off" and display commands
+        s = self.settings()
+        voltage = self.read().voltage
+        p_max = max_power(voltage)
+
+        # The state after the command
+        new = None if switching_on else struct.unpack(">f", data)[0]
+        value = new if cmd == CMD_SET_VALUE else s.value
+        over_current = new if cmd == CMD_OVER_CURRENT else s.over_current
+        over_power = new if cmd == CMD_OVER_POWER else s.over_power
+
+        if cmd == CMD_OVER_CURRENT and not 0 < over_current <= MAX_CURRENT:
+            raise DL24PError(f"Over-current protection must be above 0 and at most {MAX_CURRENT:.0f} A")
+        if cmd == CMD_OVER_POWER and not 0 < over_power <= p_max:
+            raise DL24PError(f"Over-power protection must be above 0 and at most {p_max:.0f} W "
+                             f"at {voltage:.1f} V")
+        self._check_limits(s.mode, value, voltage)
+
+        # The load enforces its own protections while it runs, so they must be within the
+        # limits too. Protections left too high (e.g. the factory 25 A) are lowered to the limit.
+        if not 0 < over_current <= MAX_CURRENT:
+            self._lower_protection(CMD_OVER_CURRENT, "over_current", MAX_CURRENT)
+        if not 0 < over_power <= p_max:
+            self._lower_protection(CMD_OVER_POWER, "over_power", p_max)
+
+    def _lower_protection(self, cmd: int, field: str, value: float) -> None:
+        # Written directly, because send() would run the guard again
+        self._dev.write(self._frame(cmd, struct.pack(">f", value)))
+        self._verify(lambda s: getattr(s, field), round(float(value), 4), field)
 
     def query(self, cmd: int) -> bytes:
         """Send a read command and return the matching 64-byte reply."""
@@ -221,7 +284,7 @@ class DL24P:
         r = self.query(CMD_READ_MEASUREMENT)
         w = struct.unpack_from("<14I", r, 4)
         status = struct.unpack_from("<H", r, 60)[0]
-        return Measurement(
+        m = Measurement(
             voltage=w[1] / 1000,
             current=w[2] / 1000,
             power=w[3] / 1000,
@@ -234,6 +297,12 @@ class DL24P:
             output_on=bool(w[12]),
             raw=w + (status,),
         )
+        # Watchdog: every measurement also checks the limits while the load is on
+        if m.output_on and (m.voltage > MAX_VOLTAGE or m.current > MAX_CURRENT * LIMIT_MARGIN
+                            or m.power > max_power(m.voltage) * LIMIT_MARGIN):
+            self._dev.write(self._frame(CMD_OUTPUT, b"\0\0\0\0"))  # switch off directly, no checks
+            raise DL24PError(f"Limit exceeded, the load was switched off: {m}")
+        return m
 
     def settings(self) -> Settings:
         """Read all settings."""
@@ -317,28 +386,70 @@ class DL24P:
         """Set the set point of the current mode (A in CC, V in CV, ohm in CR, W in CP)."""
         if value < 0:
             raise ValueError("value must be >= 0")
-        self._set_float(CMD_SET_VALUE, value)
+        self._set_float(CMD_SET_VALUE, value)  # send() checks the limits
         self._verify(lambda s: s.value, round(float(value), 4), "set point")
+
+    @staticmethod
+    def _check_limits(mode: str, value: float, voltage: float) -> None:
+        """Refuse set points outside the manual's ratings, given the voltage measured now.
+
+        The power checks use the present input voltage. If the source voltage rises later,
+        the power can still exceed the limit, so also set set_over_power() as a safety net.
+        """
+        if voltage > MAX_VOLTAGE:
+            raise DL24PError(f"Input voltage {voltage:.1f} V is above the load's {MAX_VOLTAGE:.0f} V limit")
+        p_max = max_power(voltage)
+        if mode == "CC":
+            current = value
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{current} A is above the load's {MAX_CURRENT:.0f} A limit")
+        elif mode == "CV":
+            if not MIN_VOLTAGE <= value <= MAX_VOLTAGE:
+                raise DL24PError(f"CV set point must be {MIN_VOLTAGE:.0f}-{MAX_VOLTAGE:.0f} V, got {value} V")
+            return  # the current is set by the source, so it cannot be checked here
+        elif mode == "CR":
+            if value <= 0:
+                raise DL24PError("CR set point must be above 0 ohm (0 ohm is a short circuit)")
+            current = voltage / value
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{value} ohm at {voltage:.2f} V draws {current:.1f} A, "
+                                 f"above the {MAX_CURRENT:.0f} A limit")
+        elif mode == "CP":
+            current = value / voltage if voltage > 0 else 0.0
+            if value > p_max:
+                raise DL24PError(f"{value} W is above the {p_max:.0f} W limit at {voltage:.1f} V")
+            if current > MAX_CURRENT:
+                raise DL24PError(f"{value} W at {voltage:.2f} V draws {current:.1f} A, "
+                                 f"above the {MAX_CURRENT:.0f} A limit")
+            return
+        else:
+            return
+        power = voltage * current
+        if power > p_max:
+            raise DL24PError(f"{power:.1f} W ({voltage:.2f} V x {current:.2f} A) is above "
+                             f"the {p_max:.0f} W limit at this voltage")
+
+    def _set_mode_value(self, mode: str, value: float) -> None:
+        # Check the limits first, so a rejected value does not change the mode
+        self._check_limits(mode, float(value), self.read().voltage)
+        self.set_mode(mode)
+        self.set_value(value)
 
     def set_current(self, amps: float) -> None:
         """Switch to CC and set the current."""
-        self.set_mode("CC")
-        self.set_value(amps)
+        self._set_mode_value("CC", amps)
 
     def set_voltage(self, volts: float) -> None:
         """Switch to CV and set the voltage."""
-        self.set_mode("CV")
-        self.set_value(volts)
+        self._set_mode_value("CV", volts)
 
     def set_resistance(self, ohms: float) -> None:
         """Switch to CR and set the resistance."""
-        self.set_mode("CR")
-        self.set_value(ohms)
+        self._set_mode_value("CR", ohms)
 
     def set_power(self, watts: float) -> None:
         """Switch to CP and set the power."""
-        self.set_mode("CP")
-        self.set_value(watts)
+        self._set_mode_value("CP", watts)
 
     def set_cutoff_voltage(self, volts: float) -> None:
         """D_Cutoff Volt (0 = off).
