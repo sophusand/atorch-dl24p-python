@@ -14,6 +14,7 @@ The protocol was reverse-engineered from the official ATORCH "BenFang System APP
 from __future__ import annotations
 
 import struct
+import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Iterator
@@ -158,19 +159,59 @@ class DL24P:
     Close the ATORCH PC app first, otherwise its polling mixes with yours.
     """
 
-    def __init__(self, path: bytes | None = None, address: int = 1, timeout: float = 1.0):
+    def __init__(self, path: bytes | None = None, address: int = 1, timeout: float = 1.0,
+                 mac_fix: bool = True):
+        """Open the load.
+
+        On macOS the load often does not reply after it is plugged in. With mac_fix=True the
+        library then sends the missing USB request (see dl24p.macfix) and tries again. It first
+        tries without a password, and only asks for it with the macOS dialog if that fails.
+        """
         self.address = address
         self.timeout = timeout
-        if path is None:
+        self._open(path)
+        if mac_fix and sys.platform == "darwin" and not self._replies():
+            self.close()
+            from . import macfix
+            try:
+                macfix.send_set_idle(detach=False)
+                self._open(path)
+                if self._replies():
+                    return
+                self.close()
+            except Exception:
+                pass  # fall back to the full fix below
+            try:
+                macfix.run_with_password_dialog()
+            except Exception as e:
+                raise DL24PError(f"The DL24 does not reply, and the macOS fix failed: {e}") from e
+            self._open(path, wait=3.0)  # macOS re-attaches its HID driver, which can take a moment
+            if not self._replies():
+                raise DL24PError("The DL24 still does not reply after the macOS fix. "
+                                 "Unplug the load's power supply for 10 s and try again.")
+
+    def _open(self, path: bytes | None, wait: float = 0.0) -> None:
+        deadline = time.monotonic() + wait
+        while path is None:
             devices = find()
-            if not devices:
+            if devices:
+                path = devices[0]["path"]
+            elif time.monotonic() >= deadline:
                 raise DL24PError("No ATORCH DL24 found (USB 0483:5750). Is it plugged in?")
-            path = devices[0]["path"]
+            else:
+                time.sleep(0.2)
         self._dev = hid.device()
         try:
             self._dev.open_path(path)
         except OSError as e:
             raise DL24PError(f"Could not open the DL24 ({e}). Is another program using it?") from e
+
+    def _replies(self) -> bool:
+        try:
+            self.query(CMD_READ_MEASUREMENT)
+            return True
+        except DL24PError:
+            return False
 
     # ---------- connection ----------
     def close(self) -> None:

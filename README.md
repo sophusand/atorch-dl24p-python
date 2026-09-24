@@ -21,8 +21,8 @@ traffic. It is documented byte by byte in [PROTOCOL.md](PROTOCOL.md).
 
 - ATORCH DL24 (USB product string `ATORCH DL24 V1.1.0`), USB ID `0483:5750`
 - Windows 10, Python 3.11
-- macOS and Linux should work through `hidapi` but have **not been tested** yet. See
-  [Platform notes](#platform-notes).
+- macOS 26 on an M2 MacBook, Python 3.14. See [Platform notes](#platform-notes).
+- Linux should work through `hidapi` but has **not been tested** yet.
 
 If you try it on another platform or firmware, please open an issue with the result.
 
@@ -156,7 +156,15 @@ accept the value.
 ## Platform notes
 
 - **Windows:** works out of the box, no driver needed.
-- **macOS:** should work with `pip install hidapi` (not tested).
+- **macOS:** tested on an M2 MacBook with macOS 26. Two things to know:
+  - The load's USB-C port does not work with a USB-C to USB-C cable (the Mac does not detect it).
+    Use a USB-A cable with a USB-C to USB-A adapter or hub.
+  - After it is plugged in, the load often receives commands but does not reply, because macOS
+    does not send the HID `SET_IDLE` request that Windows sends. `DL24P()` detects this and
+    fixes it automatically: the library sends the request through libusb and connects again.
+    It first tries without a password; only if that is not enough, macOS asks for your password.
+    It needs `pyusb` (installed automatically on macOS) and libusb (`brew install libusb`). You can also run the fix by hand with
+    `sudo python -m dl24p.macfix`, or turn it off with `DL24P(mac_fix=False)`.
 - **Linux:** needs permission to access the device (not tested). A udev rule such as
   `/etc/udev/rules.d/99-atorch-dl24.rules`:
 
